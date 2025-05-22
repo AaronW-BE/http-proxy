@@ -3,3 +3,7 @@
 .vscode
 
 build/
+
+# Build outputs
+go-proxy
+go-proxy.exe
