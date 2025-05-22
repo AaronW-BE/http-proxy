@@ -161,17 +161,20 @@ func send407(conn net.Conn) {
 }
 
 func handleHTTPS(target string, clientConn net.Conn, reader *bufio.Reader) {
-	serverConn, err := net.Dial("tcp", target)
+	log.Printf("handleHTTPS: attempting to connect to target %s for client %s", target, clientConn.RemoteAddr())
+	serverConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		log.Printf("handleHTTPS: failed to connect to target server %s: %v", target, err)
+		log.Printf("handleHTTPS: failed to connect to target server %s (timeout 10s): %v", target, err)
 		return
 	}
 	defer serverConn.Close()
+	log.Printf("handleHTTPS: successfully connected to target %s for client %s. Sending '200 Connection Established'.", target, clientConn.RemoteAddr())
 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		log.Printf("handleHTTPS: error writing 200 Connection Established to %s: %v", clientConn.RemoteAddr(), err)
 		return
 	}
+	log.Printf("handleHTTPS: '200 Connection Established' sent to client %s for target %s. Starting bidirectional copy.", clientConn.RemoteAddr(), target)
 
 	var wg sync.WaitGroup
 
@@ -180,20 +183,24 @@ func handleHTTPS(target string, clientConn net.Conn, reader *bufio.Reader) {
 		defer wg.Done()
 		// It's important to use the reader here, as it might contain buffered data
 		// from the client that was read after the CONNECT request line and headers.
-		if _, err := io.Copy(serverConn, reader); err != nil {
-			log.Printf("handleHTTPS: error copying client to server: %v", err)
+		if _, err := io.Copy(serverConn, reader); err != nil && err != io.EOF {
+			log.Printf("handleHTTPS: error copying client to server for client %s, target %s: %v", clientConn.RemoteAddr(), target, err)
 		}
+		log.Printf("handleHTTPS: client-to-server copy finished for client %s, target %s", clientConn.RemoteAddr(), target)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(clientConn, serverConn); err != nil {
-			log.Printf("handleHTTPS: error copying server to client: %v", err)
+		if _, err := io.Copy(clientConn, serverConn); err != nil && err != io.EOF {
+			log.Printf("handleHTTPS: error copying server to client for client %s, target %s: %v", clientConn.RemoteAddr(), target, err)
 		}
+		log.Printf("handleHTTPS: server-to-client copy finished for client %s, target %s", clientConn.RemoteAddr(), target)
 	}()
 
+	log.Printf("handleHTTPS: waiting for copy goroutines to complete for client %s and target %s", clientConn.RemoteAddr(), target)
 	wg.Wait()
+	log.Printf("handleHTTPS: copy goroutines completed for client %s and target %s", clientConn.RemoteAddr(), target)
 }
 
 func handleHTTP(method, rawURL string, headers map[string]string, reader *bufio.Reader, clientConn net.Conn, firstLine string) {
