@@ -10,11 +10,12 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	listenAddr  = ":9000"
+	// listenAddr  = ":9000" // Commented out as it's no longer directly used
 	username    = "user"
 	password    = "pass"
 	logFilePath = "proxy_access.log"
@@ -29,11 +30,12 @@ func getListenAddr() string {
 }
 
 func main() {
-	serv, err := net.Listen("tcp", listenAddr)
+	addr := getListenAddr()
+	serv, err := net.Listen("tcp", addr)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("Listening on " + listenAddr)
+	fmt.Println("Listening on " + addr)
 
 	defer func(serv net.Listener) {
 		_ = serv.Close()
@@ -57,16 +59,18 @@ func processConn(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	requestLine, err := reader.ReadString('\n')
 	if err != nil {
-		log.Println("读取请求行失败:", err)
+		log.Printf("processConn: error reading request line from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 	requestLine = strings.TrimSpace(requestLine)
 	if requestLine == "" {
+		log.Printf("processConn: received empty request line from %s", conn.RemoteAddr())
 		return
 	}
 
 	parts := strings.Split(requestLine, " ")
 	if len(parts) < 2 {
+		log.Printf("processConn: malformed request line from %s: %q", conn.RemoteAddr(), requestLine)
 		return
 	}
 	method := parts[0]
@@ -76,6 +80,12 @@ func processConn(conn net.Conn) {
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			// If it's EOF and the line is empty, it means the headers ended correctly.
+			// Otherwise, it's an unexpected error.
+			if err == io.EOF && strings.TrimSpace(line) == "" {
+				break 
+			}
+			log.Printf("processConn: error reading headers from %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 		line = strings.TrimSpace(line)
@@ -89,6 +99,7 @@ func processConn(conn net.Conn) {
 	}
 
 	if !authenticate(headers, conn) {
+		log.Printf("processConn: authentication failed for %s", conn.RemoteAddr())
 		return
 	}
 
@@ -116,12 +127,23 @@ func authenticate(headers map[string]string, conn net.Conn) bool {
 
 	decoded, err := base64.StdEncoding.DecodeString(parts[1])
 	if err != nil {
+		log.Printf("authenticate: error decoding base64 auth string from %s: %v", conn.RemoteAddr(), err)
 		send407(conn)
 		return false
 	}
 
+	expectedUser := os.Getenv("PROXY_USER")
+	if expectedUser == "" {
+		expectedUser = username // Fallback to const
+	}
+	expectedPassword := os.Getenv("PROXY_PASSWORD")
+	if expectedPassword == "" {
+		expectedPassword = password // Fallback to const
+	}
+
 	credentials := strings.SplitN(string(decoded), ":", 2)
-	if len(credentials) != 2 || credentials[0] != username || credentials[1] != password {
+	if len(credentials) != 2 || credentials[0] != expectedUser || credentials[1] != expectedPassword {
+		log.Printf("authenticate: invalid credentials or format from %s. Decoded: %q", conn.RemoteAddr(), string(decoded))
 		send407(conn)
 		return false
 	}
@@ -133,27 +155,51 @@ func send407(conn net.Conn) {
 	response := "HTTP/1.1 407 Proxy Authentication Required\r\n" +
 		"Proxy-Authenticate: Basic realm=\"Proxy\"\r\n" +
 		"\r\n"
-	conn.Write([]byte(response))
+	if _, err := conn.Write([]byte(response)); err != nil {
+		log.Printf("send407: error writing 407 response to %s: %v", conn.RemoteAddr(), err)
+	}
 }
 
 func handleHTTPS(target string, clientConn net.Conn, reader *bufio.Reader) {
 	serverConn, err := net.Dial("tcp", target)
 	if err != nil {
-		log.Println("连接服务器失败:", err)
+		log.Printf("handleHTTPS: failed to connect to target server %s: %v", target, err)
 		return
 	}
 	defer serverConn.Close()
 
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		log.Printf("handleHTTPS: error writing 200 Connection Established to %s: %v", clientConn.RemoteAddr(), err)
+		return
+	}
 
-	go io.Copy(serverConn, reader)
-	io.Copy(clientConn, serverConn)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// It's important to use the reader here, as it might contain buffered data
+		// from the client that was read after the CONNECT request line and headers.
+		if _, err := io.Copy(serverConn, reader); err != nil {
+			log.Printf("handleHTTPS: error copying client to server: %v", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := io.Copy(clientConn, serverConn); err != nil {
+			log.Printf("handleHTTPS: error copying server to client: %v", err)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func handleHTTP(method, rawURL string, headers map[string]string, reader *bufio.Reader, clientConn net.Conn, firstLine string) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
-		log.Println("解析URL失败:", err)
+		log.Printf("handleHTTP: failed to parse URL %s: %v", rawURL, err)
 		return
 	}
 
@@ -164,7 +210,7 @@ func handleHTTP(method, rawURL string, headers map[string]string, reader *bufio.
 
 	serverConn, err := net.Dial("tcp", host)
 	if err != nil {
-		log.Println("连接服务器失败:", err)
+		log.Printf("handleHTTP: failed to connect to target server %s (from URL %s): %v", host, rawURL, err)
 		return
 	}
 	defer serverConn.Close()
@@ -172,20 +218,65 @@ func handleHTTP(method, rawURL string, headers map[string]string, reader *bufio.
 	serverWriter := bufio.NewWriter(serverConn)
 
 	// 发送请求行
-	requestLine := fmt.Sprintf("%s %s %s\r\n", method, parsedURL.RequestURI(), "HTTP/1.1")
-	serverWriter.WriteString(requestLine)
+	requestLineStr := fmt.Sprintf("%s %s %s\r\n", method, parsedURL.RequestURI(), "HTTP/1.1")
+	if _, err := serverWriter.WriteString(requestLineStr); err != nil {
+		log.Printf("handleHTTP: error writing request line to server %s: %v", host, err)
+		return
+	}
 
 	// 发送请求头
 	for key, value := range headers {
 		if key != "proxy-authorization" {
-			serverWriter.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
+			headerLine := fmt.Sprintf("%s: %s\r\n", key, value)
+			if _, err := serverWriter.WriteString(headerLine); err != nil {
+				log.Printf("handleHTTP: error writing header '%s' to server %s: %v", key, host, err)
+				return
+			}
 		}
 	}
-	serverWriter.WriteString("\r\n")
-	serverWriter.Flush()
+	if _, err := serverWriter.WriteString("\r\n"); err != nil {
+		log.Printf("handleHTTP: error writing end-of-headers to server %s: %v", host, err)
+		return
+	}
+	if err := serverWriter.Flush(); err != nil {
+		log.Printf("handleHTTP: error flushing headers to server %s: %v", host, err)
+		return
+	}
 
-	go io.Copy(serverConn, reader)
-	io.Copy(clientConn, serverConn)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Copies request body from client to server
+		// The 'reader' is used here as it may contain the body if it was partially read
+		// along with headers.
+		if _, err := io.Copy(serverConn, reader); err != nil {
+			log.Printf("handleHTTP: error copying client request body to server: %v", err)
+		}
+		// We need to close the serverConn write side to signal EOF to the server
+		// especially for POST/PUT requests where the server expects the body to end.
+		if tcpConn, ok := serverConn.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		} else {
+			// For other types of net.Conn, Close may be the only option.
+			// This might also close the read side, which could be an issue if the server
+			// sends a response very quickly before this CloseWrite can take effect.
+			// However, for HTTP, usually the server waits for the full request body.
+			// serverConn.Close() // Avoid this if possible, prefer CloseWrite
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Copies response from server to client
+		if _, err := io.Copy(clientConn, serverConn); err != nil {
+			log.Printf("handleHTTP: error copying server response to client: %v", err)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func logRequest(conn net.Conn, method, target string) {
@@ -198,12 +289,19 @@ func logRequest(conn net.Conn, method, target string) {
 }
 
 func logToFile(message string) {
-	f, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	path := os.Getenv("PROXY_LOG_PATH")
+	if path == "" {
+		path = logFilePath // default path "proxy_access.log"
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Println("写入日志失败:", err)
+		log.Printf("logToFile: failed to open log file %s: %v", path, err)
 		return
 	}
 	defer f.Close()
 
-	f.WriteString(message + "\n")
+	if _, err := f.WriteString(message + "\n"); err != nil {
+		log.Printf("logToFile: error writing message to log file %s: %v", path, err)
+	}
 }
